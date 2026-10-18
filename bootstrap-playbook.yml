@@ -1,0 +1,314 @@
+---
+# Forgejo + Caddy + Node "pages" service on one Debian VM, all in Docker Compose.
+# Run by bootstrap.sh on the target itself (localhost, local connection, as root).
+# Idempotent: safe to run again at any time. Override variables with: -e key=value or -e @vars.yml
+- name: Bootstrap Forgejo, Caddy and the pages service
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    # --- layout -----------------------------------------------------------------
+    stack_dir: /opt/forgejo-caddy-pages
+    secrets_dir: "{{ stack_dir }}/secrets"
+    credentials_file: "{{ stack_dir }}/credentials.txt"
+
+    # --- images -----------------------------------------------------------------
+    forgejo_image: codeberg.org/forgejo/forgejo:11
+    caddy_image: caddy:2
+
+    # --- Forgejo ----------------------------------------------------------------
+    forgejo_http_port: 3000
+    forgejo_admin_user: forgejo-admin   # site administrator
+    pages_owner: themes                 # the ONE user whose repos are served as websites
+    pages_branch: main
+    host_ip: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
+    forgejo_root_url: "http://{{ host_ip }}:{{ forgejo_http_port }}/"
+
+    # --- Caddy ------------------------------------------------------------------
+    # ":80" = plain HTTP on whatever IP the VM has (local-network prototype).
+    # Set to a hostname (e.g. themes.corepixen.com) later to get automatic HTTPS.
+    pages_site_address: ":80"
+    # Optional extra site that reverse-proxies Forgejo (e.g. git.corepixen.com). Empty = disabled.
+    forgejo_site_address: ""
+    forgejo_proxy_block: |
+      {{ forgejo_site_address }} {
+          reverse_proxy forgejo:3000
+      }
+
+    # --- pages service ----------------------------------------------------------
+    pages_cache_ttl_ms: 30000
+
+  tasks:
+    # ============================== preflight =====================================
+    - name: Require root and Debian
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['user_id'] == 'root'
+          - ansible_facts['os_family'] == 'Debian'
+        fail_msg: Run as root on Debian (bootstrap.sh does this for you).
+
+    # ============================== Docker ========================================
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [ca-certificates, curl, gnupg]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker apt signing key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Detect dpkg architecture
+      ansible.builtin.command: dpkg --print-architecture
+      register: dpkg_arch
+      changed_when: false
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ dpkg_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ ansible_facts['distribution_release'] }} stable"
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Install Docker Engine and the compose plugin
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+        state: present
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    # ============================== stack files ===================================
+    - name: Create stack directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "{{ item.mode }}"
+        owner: "{{ item.owner | default('root') }}"
+        group: "{{ item.owner | default('root') }}"
+      loop:
+        - { path: "{{ stack_dir }}", mode: "0755" }
+        - { path: "{{ secrets_dir }}", mode: "0700" }
+        - { path: "{{ stack_dir }}/caddy", mode: "0755" }
+        - { path: "{{ stack_dir }}/data", mode: "0755" }
+        - { path: "{{ stack_dir }}/data/forgejo", mode: "0755", owner: "1000" }
+
+    - name: Load or generate the Forgejo secret key (kept in secrets/, stable across runs)
+      ansible.builtin.set_fact:
+        forgejo_secret_key: "{{ lookup('ansible.builtin.password', secrets_dir ~ '/forgejo-secret-key length=64 chars=ascii_letters,digits') }}"
+      no_log: true
+
+    - name: Build the list of Forgejo accounts (admin plus pages owner)
+      ansible.builtin.set_fact:
+        forgejo_accounts: >-
+          {{ [{'name': forgejo_admin_user, 'admin': true}]
+             + ([] if pages_owner == forgejo_admin_user else [{'name': pages_owner, 'admin': false}]) }}
+
+    - name: Copy the pages service source
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/pages-service/"
+        dest: "{{ stack_dir }}/pages-service/"
+        mode: "0644"
+        directory_mode: "0755"
+      register: pages_src
+
+    - name: Write docker-compose file
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/compose.yml"
+        mode: "0600"
+        content: |
+          # Managed by bootstrap-playbook.yml - manual edits are overwritten.
+          name: forgejo-caddy-pages
+          services:
+            forgejo:
+              image: {{ forgejo_image }}
+              restart: unless-stopped
+              environment:
+                - USER_UID=1000
+                - USER_GID=1000
+                - FORGEJO__database__DB_TYPE=sqlite3
+                - FORGEJO__security__INSTALL_LOCK=true
+                - FORGEJO__security__SECRET_KEY={{ forgejo_secret_key }}
+                - FORGEJO__server__DOMAIN={{ host_ip }}
+                - FORGEJO__server__ROOT_URL={{ forgejo_root_url }}
+                - FORGEJO__server__HTTP_PORT=3000
+                - FORGEJO__server__DISABLE_SSH=true
+                - FORGEJO__service__DISABLE_REGISTRATION=true
+                - FORGEJO__repository__DEFAULT_BRANCH={{ pages_branch }}
+                - FORGEJO__repository__DEFAULT_PRIVATE=public
+                - FORGEJO__repository__ENABLE_PUSH_CREATE_USER=true
+                - FORGEJO__repository__DEFAULT_PUSH_CREATE_PRIVATE=false
+              ports:
+                - "{{ forgejo_http_port }}:3000"
+              volumes:
+                - ./data/forgejo:/data
+                - /etc/localtime:/etc/localtime:ro
+            pages:
+              build: ./pages-service
+              image: forgejo-caddy-pages/pages:local
+              restart: unless-stopped
+              depends_on:
+                - forgejo
+              environment:
+                - FORGEJO_URL=http://forgejo:3000
+                - PAGES_OWNER={{ pages_owner }}
+                - PAGES_BRANCH={{ pages_branch }}
+                - CACHE_TTL_MS={{ pages_cache_ttl_ms }}
+            caddy:
+              image: {{ caddy_image }}
+              restart: unless-stopped
+              depends_on:
+                - pages
+              ports:
+                - "80:80"
+                - "443:443"
+              volumes:
+                - ./caddy:/etc/caddy:ro
+                - caddy_data:/data
+                - caddy_config:/config
+          volumes:
+            caddy_data:
+            caddy_config:
+
+    - name: Write Caddyfile
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/caddy/Caddyfile"
+        mode: "0644"
+        content: |
+          # Managed by bootstrap-playbook.yml - manual edits are overwritten.
+          {{ pages_site_address }} {
+              encode zstd gzip
+              reverse_proxy pages:8080
+          }
+          {{ forgejo_proxy_block if forgejo_site_address | length > 0 else '' }}
+      register: caddyfile
+
+    # ============================== start the stack ===============================
+    - name: Build the pages image (only when its source changed)
+      ansible.builtin.command: docker compose build pages
+      args:
+        chdir: "{{ stack_dir }}"
+      when: pages_src.changed
+      changed_when: true
+
+    - name: Start or update the stack
+      ansible.builtin.command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ stack_dir }}"
+      register: compose_up
+      changed_when: (compose_up.stdout + compose_up.stderr) is search('Created|Recreate|Started|Pulled')
+
+    - name: Reload Caddy after a Caddyfile change
+      ansible.builtin.command: docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+      args:
+        chdir: "{{ stack_dir }}"
+      when: caddyfile.changed
+      changed_when: true
+
+    # ============================== Forgejo accounts ==============================
+    - name: Wait until Forgejo is healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ forgejo_http_port }}/api/healthz"
+        status_code: 200
+      register: forgejo_health
+      until: forgejo_health.status == 200
+      retries: 60
+      delay: 3
+
+    - name: List existing Forgejo users
+      ansible.builtin.command: docker compose exec -T -u git forgejo forgejo admin user list
+      args:
+        chdir: "{{ stack_dir }}"
+      register: forgejo_users
+      changed_when: false
+
+    - name: Create missing Forgejo accounts with generated passwords
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - exec
+          - -T
+          - -u
+          - git
+          - forgejo
+          - forgejo
+          - admin
+          - user
+          - create
+          - --username
+          - "{{ item.name }}"
+          - --email
+          - "{{ item.name }}@forgejo.local"
+          - --password
+          - "{{ lookup('ansible.builtin.password', secrets_dir ~ '/' ~ item.name ~ '.pass length=20 chars=ascii_letters,digits') }}"
+          - "--admin={{ 'true' if item.admin else 'false' }}"
+          - --must-change-password=false
+        chdir: "{{ stack_dir }}"
+      loop: "{{ forgejo_accounts }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.name not in forgejo_users.stdout.split()
+      no_log: true
+      changed_when: true
+
+    - name: Write credentials file (one line per account)
+      ansible.builtin.lineinfile:
+        path: "{{ credentials_file }}"
+        regexp: '^{{ item.name | regex_escape }}\b'
+        line: "{{ item.name }}  password: {{ lookup('ansible.builtin.password', secrets_dir ~ '/' ~ item.name ~ '.pass length=20 chars=ascii_letters,digits') }}  ({{ 'admin' if item.admin else 'pages owner' }})"
+        create: true
+        mode: "0600"
+      loop: "{{ forgejo_accounts }}"
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+
+    # ============================== verify ========================================
+    - name: Check that the pages service answers inside the stack
+      ansible.builtin.command: docker compose exec -T pages wget -qO- http://127.0.0.1:8080/healthz
+      args:
+        chdir: "{{ stack_dir }}"
+      register: pages_health
+      until: pages_health.rc == 0
+      retries: 20
+      delay: 2
+      changed_when: false
+
+    - name: Check that Caddy forwards to the pages service
+      ansible.builtin.uri:
+        url: http://127.0.0.1/healthz
+        status_code: 200
+      register: caddy_health
+      until: caddy_health.status == 200
+      retries: 20
+      delay: 2
+      when: pages_site_address is match(':')
+
+    - name: Read credentials for the summary
+      ansible.builtin.command: cat {{ credentials_file }}
+      register: credentials
+      changed_when: false
+      no_log: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Forgejo:        {{ forgejo_root_url }}"
+          - "Pages:          http://{{ host_ip }}/<repo>/   (owner '{{ pages_owner }}', branch '{{ pages_branch }}')"
+          - "Push a site:    git push http://{{ host_ip }}:{{ forgejo_http_port }}/{{ pages_owner }}/<repo>.git main"
+          - "Accounts (also in {{ credentials_file }}):"
+          - "{{ credentials.stdout_lines }}"

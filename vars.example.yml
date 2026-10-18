@@ -1,0 +1,16 @@
+# Optional overrides for bootstrap-playbook.yml. Copy to vars.yml (git-ignored) and edit, then run:
+#   sudo ansible-playbook -i localhost, -c local bootstrap-playbook.yml -e @vars.yml
+# or pass the file through the bootstrap script:
+#   bash bootstrap.sh -e @vars.yml
+# Every key is optional; defaults are defined at the top of bootstrap-playbook.yml.
+
+# forgejo_image: codeberg.org/forgejo/forgejo:11
+# forgejo_admin_user: forgejo-admin
+# pages_owner: themes
+# pages_branch: main
+# pages_cache_ttl_ms: 30000
+
+# Later, with real DNS and TLS (not used for the local-network prototype):
+# pages_site_address: themes.corepixen.com
+# forgejo_site_address: git.corepixen.com
+# forgejo_root_url: https://git.corepixen.com/
